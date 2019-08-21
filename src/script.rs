@@ -154,27 +154,34 @@ impl<'a> ScriptInvocation<'a> {
 
     /// Asynchronously invokes the script and returns the result.
     #[inline]
-    pub fn invoke_async<T: FromRedisValue + Send + 'static>(
-        &self,
-        con: SharedConnection,
-    ) -> impl Future<Output = RedisResult<(SharedConnection, T)>> {
-        let mut eval_cmd = cmd("EVALSHA");
-        eval_cmd
-            .arg(self.script.hash.as_bytes())
-            .arg(self.keys.len())
-            .arg(&*self.keys)
-            .arg(&*self.args);
+    pub fn invoke_async<'c, T: FromRedisValue + Send + 'static>(
+        &'c self,
+        con: &'c mut SharedConnection,
+    ) -> impl Future<Output = RedisResult<T>> + 'c {
+        async move {
+            let mut eval_cmd = cmd("EVALSHA");
+            eval_cmd
+                .arg(self.script.hash.as_bytes())
+                .arg(self.keys.len())
+                .arg(&*self.keys)
+                .arg(&*self.args);
 
-        let mut load_cmd = cmd("SCRIPT");
-        load_cmd.arg("LOAD").arg(self.script.code.as_bytes());
+            let mut load_cmd = cmd("SCRIPT");
+            load_cmd.arg("LOAD").arg(self.script.code.as_bytes());
 
-        let future = eval_cmd.query_async(con.clone()).boxed();
-        InvokeAsyncFuture {
-            con: con.clone(),
-            eval_cmd,
-            load_cmd,
-            status: ScriptStatus::NotLoaded,
-            future,
+            let future = {
+                let mut con = con.clone();
+                let eval_cmd = eval_cmd.clone();
+                (async move { eval_cmd.query_async(&mut con).await }).boxed()
+            };
+            InvokeAsyncFuture {
+                con: con.clone(),
+                eval_cmd,
+                load_cmd,
+                status: ScriptStatus::NotLoaded,
+                future,
+            }
+            .await
         }
     }
 }
@@ -193,25 +200,28 @@ struct InvokeAsyncFuture<T> {
     eval_cmd: Cmd,
     load_cmd: Cmd,
     status: ScriptStatus,
-    future: RedisFuture<(SharedConnection, T)>,
+    future: RedisFuture<'static, T>,
 }
 
 impl<T> Future for InvokeAsyncFuture<T>
 where
     T: FromRedisValue + Send + 'static,
 {
-    type Output = RedisResult<(SharedConnection, T)>;
+    type Output = RedisResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Self::Output> {
         let self_ = self.get_mut();
         loop {
             match ready!(self_.future.as_mut().poll(cx)) {
-                Ok((con, val)) => {
+                Ok(val) => {
                     if self_.status == ScriptStatus::Loading {
                         self_.status = ScriptStatus::Loaded;
-                        self_.future = self_.eval_cmd.query_async(con).boxed();
+                        let mut con = self_.con.clone();
+                        let eval_cmd = self_.eval_cmd.clone();
+                        self_.future =
+                            (async move { eval_cmd.query_async(&mut con).await }).boxed();
                     } else {
-                        return Ok((con, val)).into();
+                        return Ok(val).into();
                     }
                 }
                 Err(err) => {
@@ -219,7 +229,10 @@ where
                         && self_.status == ScriptStatus::NotLoaded
                     {
                         self_.status = ScriptStatus::Loading;
-                        self_.future = self_.load_cmd.query_async(self_.con.clone()).boxed();
+                        let mut con = self_.con.clone();
+                        let load_cmd = self_.load_cmd.clone();
+                        self_.future =
+                            (async move { load_cmd.query_async(&mut con).await }).boxed();
                     } else {
                         return Err(err).into();
                     }

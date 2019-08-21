@@ -12,7 +12,13 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::tcp::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use futures::{future::Either, task::{Spawn, SpawnExt}, prelude::*, ready, task, Future, Poll, Sink, Stream};
+use futures::{
+    future::Either,
+    prelude::*,
+    ready, task,
+    task::{Spawn, SpawnExt},
+    Future, Poll, Sink, Stream,
+};
 
 use pin_project::{project, unsafe_project};
 
@@ -174,11 +180,10 @@ pub struct Connection {
     db: i64,
 }
 
-impl Connection {
-    pub async fn read_response(self) -> RedisResult<(Self, Value)> {
-        let db = self.db;
-        let (con, value) = crate::parser::parse_async(self.con).await?;
-        Ok((Connection { con, db }, value))
+impl ActualConnection {
+    pub async fn read_response(&mut self) -> RedisResult<Value> {
+        let value = crate::parser::parse_async(self).await?;
+        Ok(value)
     }
 }
 
@@ -218,63 +223,62 @@ pub fn connect(connection_info: ConnectionInfo) -> impl Future<Output = RedisRes
     };
 
     Either::Right(connection.err_into().and_then(move |con| {
-        let rv = Connection {
-            con,
-            db: connection_info.db,
-        };
+        async move {
+            let mut rv = Connection {
+                con,
+                db: connection_info.db,
+            };
 
-        let login = match connection_info.passwd {
-            Some(ref passwd) => {
-                Either::Left(cmd("AUTH").arg(&**passwd).query_async::<_, Value>(rv).map(
-                    |x| match x {
-                        Ok((rv, Value::Okay)) => Ok(rv),
+            match connection_info.passwd {
+                Some(ref passwd) => {
+                    let mut cmd = cmd("AUTH");
+                    cmd.arg(&**passwd);
+                    let x = cmd.query_async::<_, Value>(&mut rv).await;
+                    match x {
+                        Ok(Value::Okay) => (),
                         _ => {
                             fail!((
                                 ErrorKind::AuthenticationFailed,
                                 "Password authentication failed"
                             ));
                         }
-                    },
-                ))
+                    }
+                }
+                None => (),
             }
-            None => Either::Right(future::ok(rv)),
-        };
 
-        login.and_then(move |rv| {
             if connection_info.db != 0 {
-                Either::Left(
-                    cmd("SELECT")
-                        .arg(connection_info.db)
-                        .query_async::<_, Value>(rv)
-                        .map(|result| match result {
-                            Ok((rv, Value::Okay)) => Ok(rv),
-                            _ => fail!((
-                                ErrorKind::ResponseError,
-                                "Redis server refused to switch database"
-                            )),
-                        }),
-                )
+                let mut cmd = cmd("SELECT");
+                cmd.arg(connection_info.db);
+                let result = cmd.query_async::<_, Value>(&mut rv).await;
+                match result {
+                    Ok(Value::Okay) => Ok(rv),
+                    _ => fail!((
+                        ErrorKind::ResponseError,
+                        "Redis server refused to switch database"
+                    )),
+                }
             } else {
-                Either::Right(future::ok(rv))
+                Ok(rv)
             }
-        })
+        }
     }))
 }
 
 pub trait ConnectionLike: Sized {
     /// Sends an already encoded (packed) command into the TCP socket and
     /// reads the single response from it.
-    fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)>;
+    fn req_packed_command(&mut self, cmd: Vec<u8>) -> RedisFuture<Value>;
 
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement
     /// pipelining.
     fn req_packed_commands(
-        self,
+        &mut self,
         cmd: Vec<u8>,
         offset: usize,
         count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)>;
+    ) -> RedisFuture<Vec<Value>>;
 
     /// Returns the database this connection is bound to.  Note that this
     /// information might be unreliable because it's initially cached and
@@ -284,47 +288,34 @@ pub trait ConnectionLike: Sized {
 }
 
 impl ConnectionLike for Connection {
-    fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
-        let db = self.db;
-        let mut con = self.con;
+    fn req_packed_command(&mut self, cmd: Vec<u8>) -> RedisFuture<Value> {
         (async move {
-            con.write_all(&cmd).await?;
-            Connection { con, db }.read_response().await
+            self.con.write_all(&cmd).await?;
+            self.con.read_response().await
         })
             .boxed()
     }
 
     fn req_packed_commands(
-        self,
+        &mut self,
         cmd: Vec<u8>,
         offset: usize,
         count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)> {
-        let db = self.db;
-        let mut con = self.con;
+    ) -> RedisFuture<Vec<Value>> {
         (async move {
-            con.write_all(&cmd).await?;
-            let mut con = Some(Connection { con, db });
-            let mut rv = vec![];
-            let mut future = None;
-            let mut idx = 0;
-            future::poll_fn(move |cx| {
-                while idx < offset + count {
-                    if future.is_none() {
-                        future = Some(con.take().unwrap().read_response().boxed());
-                    }
-                    let (con2, item) = ready!(future.as_mut().unwrap().as_mut().poll(cx))?;
-                    con = Some(con2);
-                    future = None;
+            self.con.write_all(&cmd).await?;
 
-                    if idx >= offset {
-                        rv.push(item);
-                    }
-                    idx += 1;
+            let mut rv = Vec::with_capacity(count);
+            let mut idx = 0;
+            while idx < offset + count {
+                let item = self.con.read_response().await?;
+
+                if idx >= offset {
+                    rv.push(item);
                 }
-                Poll::Ready(Ok((con.take().unwrap(), mem::replace(&mut rv, Vec::new()))))
-            })
-            .await
+                idx += 1;
+            }
+            Ok(rv)
         })
             .boxed()
     }
@@ -611,33 +602,36 @@ impl SharedConnection {
 }
 
 impl ConnectionLike for SharedConnection {
-    fn req_packed_command(self, cmd: Vec<u8>) -> RedisFuture<(Self, Value)> {
-        let future = self.pipeline.send(cmd);
-
-        future
-            .map_ok(|value| (self, value))
-            .map_err(|err| {
+    fn req_packed_command(&mut self, cmd: Vec<u8>) -> RedisFuture<Value> {
+        (async move {
+            let value = self.pipeline.send(cmd).await.map_err(|err| {
                 err.unwrap_or_else(|| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
-            })
+            })?;
+            Ok(value)
+        })
             .boxed()
     }
 
     fn req_packed_commands(
-        self,
+        &mut self,
         cmd: Vec<u8>,
         offset: usize,
         count: usize,
-    ) -> RedisFuture<(Self, Vec<Value>)> {
-        let future = self.pipeline.send_recv_multiple(cmd, offset + count);
+    ) -> RedisFuture<Vec<Value>> {
+        (async move {
+            let mut value = self
+                .pipeline
+                .send_recv_multiple(cmd, offset + count)
+                .await
+                .map_err(|err| {
+                    err.unwrap_or_else(|| {
+                        RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe))
+                    })
+                })?;
 
-        future
-            .map_ok(move |mut value| {
-                value.drain(..offset);
-                (self, value)
-            })
-            .map_err(|err| {
-                err.unwrap_or_else(|| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
-            })
+            value.drain(..offset);
+            Ok(value)
+        })
             .boxed()
     }
 
