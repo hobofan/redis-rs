@@ -3,7 +3,7 @@ use crate::types::{
     from_redis_value, ErrorKind, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs, Value,
 };
 
-use futures::{future::Either, prelude::*};
+use futures::prelude::*;
 
 #[derive(Clone)]
 enum Arg<D> {
