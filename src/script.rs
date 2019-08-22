@@ -155,20 +155,19 @@ impl<'a> ScriptInvocation<'a> {
     /// Asynchronously invokes the script and returns the result.
     #[inline]
     pub fn invoke_async<'c, T: FromRedisValue + Send + 'static>(
-        &'c self,
+        &self,
         con: &'c mut SharedConnection,
     ) -> impl Future<Output = RedisResult<T>> + 'c {
+        let mut eval_cmd = cmd("EVALSHA");
+        eval_cmd
+            .arg(self.script.hash.as_bytes())
+            .arg(self.keys.len())
+            .arg(&*self.keys)
+            .arg(&*self.args);
+
+        let mut load_cmd = cmd("SCRIPT");
+        load_cmd.arg("LOAD").arg(self.script.code.as_bytes());
         async move {
-            let mut eval_cmd = cmd("EVALSHA");
-            eval_cmd
-                .arg(self.script.hash.as_bytes())
-                .arg(self.keys.len())
-                .arg(&*self.keys)
-                .arg(&*self.args);
-
-            let mut load_cmd = cmd("SCRIPT");
-            load_cmd.arg("LOAD").arg(self.script.code.as_bytes());
-
             let future = {
                 let mut con = con.clone();
                 let eval_cmd = eval_cmd.clone();
