@@ -13,7 +13,6 @@ use tokio::net::tcp::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
 use futures::{
-    future::Either,
     prelude::*,
     ready, task,
     task::{Spawn, SpawnExt},
@@ -187,82 +186,68 @@ impl ActualConnection {
     }
 }
 
-pub fn connect(connection_info: ConnectionInfo) -> impl Future<Output = RedisResult<Connection>> {
-    let connection = match *connection_info.addr {
+pub async fn connect(connection_info: ConnectionInfo) -> RedisResult<Connection> {
+    let con = match *connection_info.addr {
         ConnectionAddr::Tcp(ref host, port) => {
-            let socket_addr = match (&host[..], port).to_socket_addrs() {
-                Ok(mut socket_addrs) => match socket_addrs.next() {
-                    Some(socket_addr) => socket_addr,
-                    None => {
-                        return Either::Left(future::err(RedisError::from((
-                            ErrorKind::InvalidClientConfig,
-                            "No address found for host",
-                        ))));
-                    }
-                },
-                Err(err) => return Either::Left(future::err(err.into())),
-            };
+            let mut socket_addrs = (&host[..], port).to_socket_addrs()?;
+            let socket_addr = socket_addrs.next().ok_or_else(|| {
+                RedisError::from((ErrorKind::InvalidClientConfig, "No address found for host"))
+            })?;
 
-            Either::Left(
-                TcpStream::connect(&socket_addr)
-                    .err_into()
-                    .map_ok(|con| ActualConnection::Tcp(WriteWrapper(BufReader::new(con)))),
-            )
+            TcpStream::connect(&socket_addr)
+                .map_ok(|con| ActualConnection::Tcp(WriteWrapper(BufReader::new(con))))
+                .await?
         }
         #[cfg(unix)]
-        ConnectionAddr::Unix(ref path) => Either::Right(
-            UnixStream::connect(path.clone())
-                .map_ok(|stream| ActualConnection::Unix(WriteWrapper(BufReader::new(stream)))),
-        ),
+        ConnectionAddr::Unix(ref path) => {
+            UnixStream::connect(path)
+                .map_ok(|stream| ActualConnection::Unix(WriteWrapper(BufReader::new(stream))))
+                .await?
+        }
         #[cfg(not(unix))]
-        ConnectionAddr::Unix(_) => Either::Right(future::err(RedisError::from((
-            ErrorKind::InvalidClientConfig,
-            "Cannot connect to unix sockets \
-             on this platform",
-        )))),
+        ConnectionAddr::Unix(_) => {
+            return Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "Cannot connect to unix sockets \
+                 on this platform",
+            )))
+        }
     };
 
-    Either::Right(connection.err_into().and_then(move |con| {
-        async move {
-            let mut rv = Connection {
-                con,
-                db: connection_info.db,
-            };
+    let mut rv = Connection {
+        con,
+        db: connection_info.db,
+    };
 
-            match connection_info.passwd {
-                Some(ref passwd) => {
-                    let mut cmd = cmd("AUTH");
-                    cmd.arg(&**passwd);
-                    let x = cmd.query_async::<_, Value>(&mut rv).await;
-                    match x {
-                        Ok(Value::Okay) => (),
-                        _ => {
-                            fail!((
-                                ErrorKind::AuthenticationFailed,
-                                "Password authentication failed"
-                            ));
-                        }
-                    }
-                }
-                None => (),
-            }
-
-            if connection_info.db != 0 {
-                let mut cmd = cmd("SELECT");
-                cmd.arg(connection_info.db);
-                let result = cmd.query_async::<_, Value>(&mut rv).await;
-                match result {
-                    Ok(Value::Okay) => Ok(rv),
-                    _ => fail!((
-                        ErrorKind::ResponseError,
-                        "Redis server refused to switch database"
-                    )),
-                }
-            } else {
-                Ok(rv)
+    if let Some(ref passwd) = connection_info.passwd {
+        let mut cmd = cmd("AUTH");
+        cmd.arg(&**passwd);
+        let x = cmd.query_async::<_, Value>(&mut rv).await;
+        match x {
+            Ok(Value::Okay) => (),
+            _ => {
+                fail!((
+                    ErrorKind::AuthenticationFailed,
+                    "Password authentication failed"
+                ));
             }
         }
-    }))
+    }
+
+    if connection_info.db != 0 {
+        let mut cmd = cmd("SELECT");
+        cmd.arg(connection_info.db);
+        let result = cmd.query_async::<_, Value>(&mut rv).await;
+        match result {
+            Ok(Value::Okay) => Ok(rv),
+            _ => fail!((
+                ErrorKind::ResponseError,
+                "Redis server refused to switch database"
+            )),
+        }
+    } else {
+        Ok(rv)
+    }
 }
 
 pub trait ConnectionLike: Sized {
@@ -532,41 +517,39 @@ where
     }
 
     // `None` means that the stream was out of items causing that poll loop to shut down.
-    fn send(&self, item: SinkItem) -> impl Future<Output = Result<I, Option<E>>> + Send {
+    async fn send(&mut self, item: SinkItem) -> Result<I, Option<E>> {
         self.send_recv_multiple(item, 1)
             .map_ok(|mut item| item.pop().unwrap())
+            .await
     }
 
-    fn send_recv_multiple(
-        &self,
+    async fn send_recv_multiple(
+        &mut self,
         input: SinkItem,
         count: usize,
-    ) -> impl Future<Output = Result<Vec<I>, Option<E>>> + Send {
-        let mut self_ = self.0.clone();
-        async move {
-            let (sender, receiver) = oneshot::channel();
+    ) -> Result<Vec<I>, Option<E>> {
+        let (sender, receiver) = oneshot::channel();
 
-            self_
-                .send(PipelineMessage {
-                    input,
-                    response_count: count,
-                    output: sender,
-                })
-                .map_err(|_| None)
-                .and_then(|_| {
-                    receiver.then(|result| {
-                        future::ready(match result {
-                            Ok(result) => result.map_err(Some),
-                            Err(_) => {
-                                // The `sender` was dropped which likely means that the stream part
-                                // failed for one reason or another
-                                Err(None)
-                            }
-                        })
+        self.0
+            .send(PipelineMessage {
+                input,
+                response_count: count,
+                output: sender,
+            })
+            .map_err(|_| None)
+            .and_then(|_| {
+                receiver.then(|result| {
+                    future::ready(match result {
+                        Ok(result) => result.map_err(Some),
+                        Err(_) => {
+                            // The `sender` was dropped which likely means that the stream part
+                            // failed for one reason or another
+                            Err(None)
+                        }
                     })
                 })
-                .await
-        }
+            })
+            .await
     }
 }
 
