@@ -595,7 +595,7 @@ impl Pipeline {
         self.commands.clear();
     }
 
-    async fn execute_pipelined_async<C>(self, con: &mut C) -> RedisResult<Value>
+    async fn execute_pipelined_async<C>(&self, con: &mut C) -> RedisResult<Value>
     where
         C: crate::aio::ConnectionLike + Send + 'static,
     {
@@ -609,7 +609,7 @@ impl Pipeline {
         Ok(self.make_pipeline_results(value))
     }
 
-    async fn execute_transaction_async<C>(self, con: &mut C) -> RedisResult<Value>
+    async fn execute_transaction_async<C>(&self, con: &mut C) -> RedisResult<Value>
     where
         C: crate::aio::ConnectionLike + Send + 'static,
     {
@@ -632,7 +632,7 @@ impl Pipeline {
     }
 
     #[inline]
-    pub async fn query_async<C, T: FromRedisValue>(self, con: &mut C) -> RedisResult<T>
+    pub async fn query_async<C, T: FromRedisValue>(&self, con: &mut C) -> RedisResult<T>
     where
         C: crate::aio::ConnectionLike + Send + 'static,
         T: Send + 'static,
