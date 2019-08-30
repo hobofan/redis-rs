@@ -161,7 +161,6 @@ fn bench_shared_async_implicit_pipeline(b: &mut Bencher) {
         let _: () = runtime
             .block_on(async {
                 cmds.iter()
-                    .cloned()
                     .map(|cmd| {
                         let mut con = con.clone();
                         async move { cmd.query_async(&mut con).await }
