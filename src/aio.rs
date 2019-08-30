@@ -290,15 +290,13 @@ impl ConnectionLike for Connection {
         (async move {
             self.con.write_all(&cmd).await?;
 
-            let mut rv = Vec::with_capacity(count);
-            let mut idx = 0;
-            while idx < offset + count {
-                let item = self.con.read_response().await?;
+            for _ in 0..offset {
+                self.con.read_response().await?;
+            }
 
-                if idx >= offset {
-                    rv.push(item);
-                }
-                idx += 1;
+            let mut rv = Vec::with_capacity(count);
+            for _ in 0..count {
+                rv.push(self.con.read_response().await?);
             }
             Ok(rv)
         })
