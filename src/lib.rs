@@ -300,7 +300,6 @@
 //! concessions to make it fit the constraints of `futures`.
 //!
 //! ```rust,no_run
-//! #![feature(async_await)]
 //! use futures::prelude::*;
 //!
 //! # #[tokio::main]
@@ -339,7 +338,6 @@
 //! heavily encouraged to use the URL based configuration format which
 //! is a lot more stable than the structs.
 
-#![feature(async_await)]
 #![deny(non_camel_case_types)]
 
 #[macro_use]
