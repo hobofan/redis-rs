@@ -18,13 +18,13 @@ sha1 = ">= 0.2, < 0.7"
 url = "1.2"
 combine = "3.8.1"
 bytes = "0.4"
-futures = { version = "0.3.0-alpha.18", package = "futures-preview" }
+futures = { version = "0.3.0-alpha.19", package = "futures-preview" }
 pin-project = "0.3"
-tokio-codec = "0.2.0-alpha.2"
-tokio-executor = "0.2.0-alpha.2"
-tokio-io = { version = "0.2.0-alpha.2", default-features = false, features = ["util"] }
-tokio-net = { version = "0.2.0-alpha.2", default-features = false, features = ["tcp", "uds"] }
-tokio-sync = { version = "0.2.0-alpha.4", default-features = false, features = ["async-traits"]  }
+tokio-codec = "0.2.0-alpha.6"
+tokio-executor = "0.2.0-alpha.6"
+tokio-io = { version = "0.2.0-alpha.6", default-features = false, features = ["util"] }
+tokio-net = { version = "0.2.0-alpha.6", default-features = false, features = ["tcp", "uds"] }
+tokio-sync = { version = "0.2.0-alpha.6", default-features = false, features = ["async-traits"]  }
 
 [features]
 default = [ "geospatial" ]
@@ -39,7 +39,7 @@ fnv = "1.0.5"
 criterion = "0.2"
 partial-io = { version = "0.3", features = ["tokio", "quickcheck"] }
 quickcheck = "0.6"
-tokio = "0.2.0-alpha.2"
+tokio = "0.2.0-alpha.6"
 
 [[bench]]
 name = "bench_basic"
